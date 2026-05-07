@@ -1,12 +1,11 @@
 @page "/agentfx"
 @using Microsoft.Extensions.AI
-@using Microsoft.Agents.AI
 @using Microsoft.AspNetCore.Components
 @inject CRUDTasksWithAgent.Services.IAgentFrameworkProvider AgentProvider
 @inject IJSRuntime JSRuntime
 @rendermode InteractiveServer
 
-@if (AgentProvider.Agent == null)
+@if (AgentProvider.ChatClient == null)
 {
     <div class="alert alert-warning" role="alert">
         The Agent Framework agent is not configured. Please set the required environment 
@@ -22,22 +21,15 @@ else
                 <h3 class="mb-0">Microsoft Agent Framework</h3>
             </div>
             <div class="card-body flex-grow-1 overflow-auto" id="chatMessages" style="min-height: 0;">
-                @{
-                    ChatRole? lastRole = null;
-                }
-                @foreach (var message in this.agentThread?.GetService<IList<ChatMessage>>() ?? Enumerable.Empty<ChatMessage>())
+                @foreach (var message in messages)
                 {
                     if (string.IsNullOrWhiteSpace(message.Text))
                     {
                         continue;
                     }
-                    bool showAvatar = lastRole != message.Role;
-                    if (showAvatar)
-                    {
-                        <div class="my-2 fw-bold d-flex @(message.Role == ChatRole.User ? "justify-content-end" : "justify-content-start")">
-                            @(message.Role == ChatRole.User ? "User" : "Agent")
-                        </div>
-                    }
+                    <div class="my-2 fw-bold d-flex @(message.Role == ChatRole.User ? "justify-content-end" : "justify-content-start")">
+                        @(message.Role == ChatRole.User ? "User" : "Agent")
+                    </div>
                     <div class="mb-2 p-2 rounded @((message.Role == ChatRole.User) ? "bg-primary text-white ms-auto" : "bg-success bg-opacity-10 text-dark me-auto")" style="max-width: 80%; word-break: break-word;">
                         @if (message.Role == ChatRole.User)
                         {
@@ -48,7 +40,6 @@ else
                             @((MarkupString)message.Text.Replace("\n", "<br />"))
                         }
                     </div>
-                    lastRole = message.Role;
                 }
             </div>
             <div class="card-footer bg-light">
@@ -65,25 +56,97 @@ else
 
 @code {
     private string? userInput;
-    private AIAgent? Agent => AgentProvider.Agent;
-    // Use the thread created by the provider (scoped to browser session)
-    private AgentThread? agentThread => AgentProvider.Thread;
+    private List<ChatMessage> messages = new();
 
-    // Given the injected Agent Framework agent and the thread, simply call Agent.RunAsync()
-    // to process the user prompt.
+    protected override void OnInitialized()
+    {
+        // Add system message with instructions
+        messages.Add(new ChatMessage(ChatRole.System, @"You are an agent that manages tasks using CRUD operations. 
+            Use the provided functions to create, read, update, and delete tasks. 
+            Always call the appropriate function for any task management request.
+            Don't try to handle any requests that are not related to task management.
+            When handling requests, if you're missing any information, don't make it up but prompt the user for it instead."));
+    }
 
     private async Task SendMessageAsync()
     {
-        if (!string.IsNullOrWhiteSpace(this.userInput) && this.Agent != null)
+        if (!string.IsNullOrWhiteSpace(this.userInput) && AgentProvider.ChatClient != null && AgentProvider.Tools != null)
         {
             var sentInput = this.userInput;
+            
+            // Add user message to the list
+            messages.Add(new ChatMessage(ChatRole.User, sentInput));
+            
             this.userInput = string.Empty;
             StateHasChanged();
 
-            // Send message to agent and get response using Agent Framework pattern
-            var response = await this.Agent.RunAsync(sentInput, this.agentThread);
-            
-            StateHasChanged();
+            try
+            {
+                // Create ChatOptions with tools
+                var options = new ChatOptions();
+                if (AgentProvider.Tools != null)
+                {
+                    foreach (var tool in AgentProvider.Tools)
+                    {
+                        options.Tools.Add(tool);
+                    }
+                }
+
+                // Call the chat client with tools using fully qualified extension method
+                var chatClient = AgentProvider.ChatClient;
+                
+                // Use fully qualified namespace to avoid ambiguity
+                var extensionsType = Type.GetType("Microsoft.Extensions.AI.ChatClientExtensions, Microsoft.Extensions.AI.Abstractions");
+                var completeMethod = extensionsType?.GetMethod("CompleteAsync", 
+                    System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static,
+                    null,
+                    new[] { typeof(IChatClient), typeof(IList<ChatMessage>), typeof(ChatOptions), typeof(CancellationToken) },
+                    null);
+                
+                if (completeMethod != null)
+                {
+                    var task = (Task<ChatResponse>)completeMethod.Invoke(null, new object[] { chatClient, messages, options, CancellationToken.None })!;
+                    var response = await task;
+                    
+                    // Get the text from response - use reflection to handle unknown structure
+                    if (response != null)
+                    {
+                        var messageProperty = response.GetType().GetProperty("Message");
+                        if (messageProperty != null)
+                        {
+                            var chatMessage = messageProperty.GetValue(response) as ChatMessage;
+                            if (chatMessage != null && !string.IsNullOrWhiteSpace(chatMessage.Text))
+                            {
+                                messages.Add(chatMessage);
+                            }
+                        }
+                        else
+                        {
+                            // Fallback: try to get text content directly
+                            var textProperty = response.GetType().GetProperty("Text");
+                            if (textProperty != null)
+                            {
+                                var text = textProperty.GetValue(response)?.ToString();
+                                if (!string.IsNullOrWhiteSpace(text))
+                                {
+                                    messages.Add(new ChatMessage(ChatRole.Assistant, text));
+                                }
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    messages.Add(new ChatMessage(ChatRole.Assistant, "Error: Could not invoke chat completion"));
+                }
+                
+                StateHasChanged();
+            }
+            catch (Exception ex)
+            {
+                messages.Add(new ChatMessage(ChatRole.Assistant, $"Error: {ex.Message}"));
+                StateHasChanged();
+            }
         }
     }
 
@@ -97,11 +160,6 @@ else
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
-        await JSRuntime.InvokeVoidAsync("eval", @"
-            var element = document.getElementById('chatMessages');
-            if (element) {
-                element.scrollTop = element.scrollHeight;
-            }
-        ");
+        await JSRuntime.InvokeVoidAsync("eval", "setTimeout(() => { const chatMessages = document.getElementById('chatMessages'); if (chatMessages) chatMessages.scrollTop = chatMessages.scrollHeight; }, 100);");
     }
 }

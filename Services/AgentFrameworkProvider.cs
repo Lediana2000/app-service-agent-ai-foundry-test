@@ -1,8 +1,10 @@
-using Microsoft.Extensions.AI;
-using Microsoft.Agents.AI;
 using Azure.AI.OpenAI;
 using Azure.Identity;
 using CRUDTasksWithAgent.Tools;
+using Microsoft.Agents.AI;
+using Microsoft.Extensions.AI;
+using System;
+using System.Collections.Generic;
 
 namespace CRUDTasksWithAgent.Services
 {
@@ -14,21 +16,21 @@ namespace CRUDTasksWithAgent.Services
 
     public interface IAgentFrameworkProvider
     {
-        AIAgent? Agent { get; }
-        AgentThread? Thread { get; }
+        IChatClient? ChatClient { get; }
+        List<AIFunction>? Tools { get; }
     }
 
     public class AgentFrameworkProvider : IAgentFrameworkProvider
     {
-        private readonly Lazy<(AIAgent? Agent, AgentThread? Thread)> _lazyAgentData;
+        private readonly Lazy<(IChatClient?, List<AIFunction>?)> _lazyAgentData;
 
-        public AIAgent? Agent => _lazyAgentData.Value.Agent;
-        public AgentThread? Thread => _lazyAgentData.Value.Thread;
+        public IChatClient? ChatClient => _lazyAgentData.Value.Item1;
+        public List<AIFunction>? Tools => _lazyAgentData.Value.Item2;
 
         public AgentFrameworkProvider(IConfiguration config, IServiceProvider sp)
         {
-            // Use Lazy<T> to defer agent and thread creation until first access
-            _lazyAgentData = new Lazy<(AIAgent?, AgentThread?)>(() =>
+            // Use Lazy<T> to defer agent creation until first access
+            _lazyAgentData = new Lazy<(IChatClient?, List<AIFunction>?)>(() =>
             {
                 // Get Azure OpenAI configuration
                 var deployment = config["ModelDeployment"];
@@ -40,6 +42,9 @@ namespace CRUDTasksWithAgent.Services
 
                 try
                 {
+                    // Get TaskCrudTool instance from service provider
+                    var taskCrudTool = sp.GetRequiredService<TaskCrudTool>();
+
                     // Create IChatClient
                     IChatClient chatClient = new AzureOpenAIClient(
                             new Uri(endpoint),
@@ -47,28 +52,16 @@ namespace CRUDTasksWithAgent.Services
                         .GetChatClient(deployment)
                         .AsIChatClient();
 
-                    // Get TaskCrudTool instance from service provider
-                    var taskCrudTool = sp.GetRequiredService<TaskCrudTool>();
+                    // Create list of tools
+                    var tools = new List<AIFunction>
+                    {
+                        AIFunctionFactory.Create(taskCrudTool.CreateTaskAsync),
+                        AIFunctionFactory.Create(taskCrudTool.ReadTasksAsync),
+                        AIFunctionFactory.Create(taskCrudTool.UpdateTaskAsync),
+                        AIFunctionFactory.Create(taskCrudTool.DeleteTaskAsync)
+                    };
 
-                    // Create agent with tools
-                    var agent = chatClient.CreateAIAgent(
-                        instructions: @"You are an agent that manages tasks using CRUD operations. 
-                            Use the provided functions to create, read, update, and delete tasks. 
-                            Always call the appropriate function for any task management request.
-                            Don't try to handle any requests that are not related to task management.
-                            When handling requests, if you're missing any information, don't make it up but prompt the user for it instead.",
-                        tools:
-                        [
-                            AIFunctionFactory.Create(taskCrudTool.CreateTaskAsync),
-                            AIFunctionFactory.Create(taskCrudTool.ReadTasksAsync),
-                            AIFunctionFactory.Create(taskCrudTool.UpdateTaskAsync),
-                            AIFunctionFactory.Create(taskCrudTool.DeleteTaskAsync)
-                        ]);
-
-                    // Create thread for this scoped instance (persists across navigation)
-                    var thread = agent.GetNewThread();
-
-                    return (agent, thread);
+                    return (chatClient, tools);
                 }
                 catch
                 {
